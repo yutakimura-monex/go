@@ -30,6 +30,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"crypto/md5"
+	"encoding/hex"
+	"math/rand"
+
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http/httpproxy"
 )
@@ -280,6 +284,12 @@ type Transport struct {
 	// To use a custom dialer or TLS config and still attempt HTTP/2
 	// upgrades, set this to true.
 	ForceAttemptHTTP2 bool
+
+	// digest auth fields
+	nonceCount nonceCount
+	authParts  map[string]string
+	needAuth   bool
+	basicAuth  bool
 }
 
 // A cancelKey is the key of the reqCanceler map.
@@ -515,6 +525,13 @@ func (t *Transport) roundTrip(req *Request) (*Response, error) {
 	scheme := req.URL.Scheme
 	isHTTP := scheme == "http" || scheme == "https"
 	if isHTTP {
+		if scheme == "http" && t.needAuth && !t.basicAuth {
+			p, err := t.Proxy(req)
+			if err == nil {
+				auth := t.makeAuthorization(p, req, t.authParts)
+				req.Header.Add(proxyAuthorization, auth)
+			}
+		}
 		for k, vv := range req.Header {
 			if !httpguts.ValidHeaderFieldName(k) {
 				req.closeBody()
@@ -590,6 +607,21 @@ func (t *Transport) roundTrip(req *Request) (*Response, error) {
 			resp, err = pconn.alt.RoundTrip(req)
 		} else {
 			resp, err = pconn.roundTrip(treq)
+		}
+		if err == nil {
+			if resp.StatusCode == 407 && req.URL.Scheme == "http" {
+				if strings.HasPrefix(resp.Header[proxyAuthenticate][0], "Basic") {
+					t.basicAuth = true
+				} else {
+					t.basicAuth = false
+					t.authParts, err = makeParts(resp)
+					if err != nil {
+						return nil, err
+					}
+				}
+				t.needAuth = true
+				return t.roundTrip(req)
+			}
 		}
 		if err == nil {
 			resp.Request = origReq
@@ -1639,9 +1671,11 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 		}
 	case cm.targetScheme == "http":
 		pconn.isProxy = true
-		if pa := cm.proxyAuth(); pa != "" {
-			pconn.mutateHeaderFunc = func(h Header) {
-				h.Set("Proxy-Authorization", pa)
+		if t.needAuth && t.basicAuth {
+			if pa := cm.proxyAuth(); pa != "" {
+				pconn.mutateHeaderFunc = func(h Header) {
+					h.Set(proxyAuthorization, pa)
+				}
 			}
 		}
 	case cm.targetScheme == "https":
@@ -1662,7 +1696,18 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 		}
 		if pa := cm.proxyAuth(); pa != "" {
 			hdr = hdr.Clone()
-			hdr.Set("Proxy-Authorization", pa)
+			if t.basicAuth {
+				hdr.Set("Proxy-Authorization", pa)
+			} else {
+				connectReq := &Request{
+					Method: "CONNECT",
+					URL:    &url.URL{Opaque: cm.targetAddr},
+					Host:   cm.targetAddr,
+					Header: hdr,
+				}
+				auth := t.makeAuthorization(cm.proxyURL, connectReq, t.authParts)
+				hdr.Set(proxyAuthorization, auth)
+			}
 		}
 		connectReq := &Request{
 			Method: "CONNECT",
@@ -1713,6 +1758,14 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 			return nil, err
 		}
 		if resp.StatusCode != 200 {
+			if resp.StatusCode == 407 {
+				t.authParts, err = makeParts(resp)
+				if err != nil {
+					return nil, err
+				}
+				t.needAuth = true
+				return t.dialConn(ctx, cm)
+			}
 			f := strings.SplitN(resp.Status, " ", 2)
 			conn.Close()
 			if len(f) < 2 {
@@ -2895,4 +2948,103 @@ func (cl *connLRU) remove(pc *persistConn) {
 // len returns the number of items in the cache.
 func (cl *connLRU) len() int {
 	return len(cl.m)
+}
+
+// digest auth implementation
+
+const nonce = "nonce"
+const qop = "qop"
+const realm = "realm"
+const proxyAuthenticate = "Proxy-Authenticate"
+const proxyAuthorization = "Proxy-Authorization"
+
+var digestAuthHeanderswanted = []string{nonce, qop, realm}
+
+func getRandomString(l int) string {
+	str := "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	bytes := []byte(str)
+	var result []byte
+	lstr := len(str) - 1
+	for i := 0; i < l; i++ {
+		n := getRandomInt(0, lstr)
+		result = append(result, bytes[n])
+	}
+	return string(result)
+}
+
+var r = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+func getRandomInt(min, max int) int {
+	sub := max - min + 1
+	if sub <= 1 {
+		return min
+	}
+	return min + r.Intn(sub)
+}
+
+func (t *Transport) makeAuthorization(proxy *url.URL, req *Request, parts map[string]string) string {
+	username, password := "", ""
+	if u := proxy.User; u != nil {
+		username = u.Username()
+		password, _ = u.Password()
+	}
+	ha1 := getMD5([]string{username, parts[realm], password})
+	ha2 := getMD5([]string{req.Method, req.URL.String()})
+	cnonce := getRandomString(16)
+	nc := t.getNonceCount()
+	response := getMD5([]string{
+		ha1,
+		parts[nonce],
+		nc,
+		cnonce,
+		parts[qop],
+		ha2,
+	})
+	return fmt.Sprintf(
+		`Digest username="%s", realm="%s", nonce="%s", uri="%s", qop=%s, nc=%s, cnonce="%s", response="%s"`,
+		username,
+		parts[realm],
+		parts[nonce],
+		req.URL.String(),
+		parts[qop],
+		nc,
+		cnonce,
+		response,
+	)
+}
+
+func makeParts(resp *Response) (map[string]string, error) {
+	headers := strings.Split(resp.Header[proxyAuthenticate][0], ",")
+	parts := make(map[string]string, len(digestAuthHeanderswanted))
+	for _, r := range headers {
+		for _, w := range digestAuthHeanderswanted {
+			if strings.Contains(r, w) {
+				parts[w] = strings.Split(r, `"`)[1]
+			}
+		}
+	}
+
+	if len(parts) != len(digestAuthHeanderswanted) {
+		return nil, fmt.Errorf("header is invalid: %+v", parts)
+	}
+
+	return parts, nil
+}
+
+type nonceCount int
+
+func (nc nonceCount) String() string {
+	c := int(nc)
+	return fmt.Sprintf("%08x", c)
+}
+
+func getMD5(texts []string) string {
+	h := md5.New()
+	_, _ = io.WriteString(h, strings.Join(texts, ":"))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func (t *Transport) getNonceCount() string {
+	t.nonceCount++
+	return t.nonceCount.String()
 }
