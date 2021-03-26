@@ -1,42 +1,24 @@
-# The Go Programming Language
+# プロキシ経由で go get を使うためのパッチ
+net/http でプロキシのダイジェスト認証(Proxy-Authentication: Digest Access Authentication)を使えるようにするパッチです。
 
-Go is an open source programming language that makes it easy to build simple,
-reliable, and efficient software.
+参考: https://github.com/golang/go/issues/29409
 
-![Gopher image](https://golang.org/doc/gopher/fiveyears.jpg)
-*Gopher image by [Renee French][rf], licensed under [Creative Commons 3.0 Attributions license][cc3-by].*
+## ビルド
+`./src/all.bash`
 
-Our canonical Git repository is located at https://go.googlesource.com/go.
-There is a mirror of the repository at https://github.com/golang/go.
+## Docker
+GoアプリをビルドするためのDockerイメージを作成できます。
+ビルド後に `docker build . -t go-dev:latest` してください。
 
-Unless otherwise noted, the Go source files are distributed under the
-BSD-style license found in the LICENSE file.
+## 使い方
+環境変数にプロキシを設定してください。
 
-### Download and Install
+```
+http_proxy=http://user:password@proxyhost:proxyport/
+https_proxy=http://user:password@proxyhost:proxyport/
+no_proxy=
+```
 
-#### Binary Distributions
-
-Official binary distributions are available at https://golang.org/dl/.
-
-After downloading a binary release, visit https://golang.org/doc/install
-for installation instructions.
-
-#### Install From Source
-
-If a binary distribution is not available for your combination of
-operating system and architecture, visit
-https://golang.org/doc/install/source
-for source installation instructions.
-
-### Contributing
-
-Go is the work of thousands of contributors. We appreciate your help!
-
-To contribute, please read the contribution guidelines at https://golang.org/doc/contribute.html.
-
-Note that the Go project uses the issue tracker for bug reports and
-proposals only. See https://golang.org/wiki/Questions for a list of
-places to ask questions about the Go language.
-
-[rf]: https://reneefrench.blogspot.com/
-[cc3-by]: https://creativecommons.org/licenses/by/3.0/
+## 補足事項
+- Basic認証はデフォルトで対応しています。このパッチは不要です。環境変数だけ設定すればBasic認証が通ります。
+- fork元ブランチは master で、パッチブランチは main です。
